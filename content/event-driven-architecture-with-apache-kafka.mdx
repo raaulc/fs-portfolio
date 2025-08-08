@@ -1,0 +1,480 @@
+---
+title: "Event-Driven Architecture with Apache Kafka: Building Scalable Systems"
+publishedAt: "2024-11-20"
+summary: "A deep dive into implementing event-driven architecture using Apache Kafka for high-throughput, reliable message processing"
+tags: ["Apache Kafka", "Event-Driven Architecture", "Microservices", "Java", "Distributed Systems", "Backend"]
+---
+
+# Event-Driven Architecture with Apache Kafka: Building Scalable Systems
+
+Event-driven architecture has become the foundation for building scalable, resilient systems that can handle millions of events per second. This guide explores how to implement event-driven architecture using Apache Kafka, with practical examples from sports betting platforms.
+
+![Event-Driven Architecture](/web-developement.jpeg)
+
+## Understanding Event-Driven Architecture
+
+Event-driven architecture (EDA) decouples services by using events as the primary communication mechanism. Instead of direct service-to-service calls, services publish events that other services can consume asynchronously.
+
+### Key Benefits
+
+- **Loose Coupling**: Services don't need to know about each other
+- **Scalability**: Services can scale independently
+- **Resilience**: System continues operating even if some services fail
+- **Real-time Processing**: Events are processed as they occur
+
+## Apache Kafka Fundamentals
+
+### Core Concepts
+
+Kafka is a distributed streaming platform that provides:
+- **Topics**: Named feeds where messages are published
+- **Partitions**: Topics are divided into partitions for parallel processing
+- **Producers**: Applications that publish messages to topics
+- **Consumers**: Applications that read messages from topics
+- **Brokers**: Kafka servers that store the data
+
+### Topic Design
+
+```java
+// Define topic configuration
+@Configuration
+public class KafkaTopicConfig {
+    
+    @Bean
+    public NewTopic oddsUpdatesTopic() {
+        return TopicBuilder.name("odds-updates")
+            .partitions(6)
+            .replicas(3)
+            .configs(Map.of(
+                "retention.ms", "86400000", // 24 hours
+                "cleanup.policy", "delete"
+            ))
+            .build();
+    }
+    
+    @Bean
+    public NewTopic betEventsTopic() {
+        return TopicBuilder.name("bet-events")
+            .partitions(12)
+            .replicas(3)
+            .configs(Map.of(
+                "retention.ms", "604800000", // 7 days
+                "cleanup.policy", "delete"
+            ))
+            .build();
+    }
+}
+```
+
+## Implementing Event Producers
+
+### Spring Boot Kafka Producer
+
+```java
+@Component
+public class OddsEventProducer {
+    
+    private final KafkaTemplate<String, OddsEvent> kafkaTemplate;
+    private final ObjectMapper objectMapper;
+    
+    public void publishOddsUpdate(OddsEvent event) {
+        try {
+            String key = event.getEventId();
+            String value = objectMapper.writeValueAsString(event);
+            
+            kafkaTemplate.send("odds-updates", key, value)
+                .addCallback(
+                    result -> log.info("Odds update published: {}", event.getEventId()),
+                    ex -> log.error("Failed to publish odds update: {}", ex.getMessage())
+                );
+        } catch (Exception e) {
+            log.error("Error publishing odds update", e);
+            throw new RuntimeException("Failed to publish event", e);
+        }
+    }
+    
+    public void publishBetEvent(BetEvent event) {
+        try {
+            String key = event.getBetId();
+            String value = objectMapper.writeValueAsString(event);
+            
+            kafkaTemplate.send("bet-events", key, value)
+                .addCallback(
+                    result -> log.info("Bet event published: {}", event.getBetId()),
+                    ex -> log.error("Failed to publish bet event: {}", ex.getMessage())
+                );
+        } catch (Exception e) {
+            log.error("Error publishing bet event", e);
+            throw new RuntimeException("Failed to publish event", e);
+        }
+    }
+}
+```
+
+### Event Models
+
+```java
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class OddsEvent {
+    
+    private String eventId;
+    private String marketId;
+    private BigDecimal oddsValue;
+    private String bookmaker;
+    private Instant timestamp;
+    private EventType eventType;
+    
+    // Constructors, getters, setters
+    
+    public enum EventType {
+        ODDS_UPDATE,
+        MARKET_SUSPENDED,
+        MARKET_OPENED
+    }
+}
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class BetEvent {
+    
+    private String betId;
+    private String userId;
+    private String eventId;
+    private BigDecimal stake;
+    private BigDecimal odds;
+    private BetStatus status;
+    private Instant timestamp;
+    
+    // Constructors, getters, setters
+    
+    public enum BetStatus {
+        PLACED,
+        CONFIRMED,
+        SETTLED,
+        CANCELLED
+    }
+}
+```
+
+## Implementing Event Consumers
+
+### Spring Boot Kafka Consumer
+
+```java
+@Component
+@Slf4j
+public class OddsEventConsumer {
+    
+    private final OddsService oddsService;
+    private final NotificationService notificationService;
+    
+    @KafkaListener(
+        topics = "odds-updates",
+        groupId = "odds-processor",
+        containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void handleOddsUpdate(String message, @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+        try {
+            OddsEvent event = objectMapper.readValue(message, OddsEvent.class);
+            log.info("Processing odds update: {}", event.getEventId());
+            
+            // Process the odds update
+            oddsService.processOddsUpdate(event);
+            
+            // Notify relevant services
+            notificationService.notifyOddsChange(event);
+            
+        } catch (Exception e) {
+            log.error("Error processing odds update: {}", e.getMessage(), e);
+            // Implement dead letter queue logic
+            handleDeadLetter(message, topic, e);
+        }
+    }
+    
+    @KafkaListener(
+        topics = "bet-events",
+        groupId = "bet-processor",
+        containerFactory = "kafkaListenerContainerFactory"
+    )
+    public void handleBetEvent(String message, @Header(KafkaHeaders.RECEIVED_TOPIC) String topic) {
+        try {
+            BetEvent event = objectMapper.readValue(message, BetEvent.class);
+            log.info("Processing bet event: {}", event.getBetId());
+            
+            // Process the bet event
+            betService.processBetEvent(event);
+            
+            // Update user balance
+            userService.updateBalance(event.getUserId(), event.getStake());
+            
+        } catch (Exception e) {
+            log.error("Error processing bet event: {}", e.getMessage(), e);
+            handleDeadLetter(message, topic, e);
+        }
+    }
+}
+```
+
+## Dead Letter Queue Implementation
+
+### Dead Letter Topic Configuration
+
+```java
+@Component
+public class DeadLetterQueueHandler {
+    
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    
+    public void handleDeadLetter(String message, String originalTopic, Exception error) {
+        DeadLetterEvent deadLetterEvent = DeadLetterEvent.builder()
+            .originalMessage(message)
+            .originalTopic(originalTopic)
+            .errorMessage(error.getMessage())
+            .timestamp(Instant.now())
+            .retryCount(0)
+            .build();
+        
+        String deadLetterMessage = objectMapper.writeValueAsString(deadLetterEvent);
+        kafkaTemplate.send("dead-letter-queue", deadLetterMessage);
+    }
+    
+    @KafkaListener(topics = "dead-letter-queue", groupId = "dlq-processor")
+    public void processDeadLetter(String message) {
+        try {
+            DeadLetterEvent event = objectMapper.readValue(message, DeadLetterEvent.class);
+            
+            if (event.getRetryCount() < 3) {
+                // Retry processing
+                event.setRetryCount(event.getRetryCount() + 1);
+                kafkaTemplate.send(event.getOriginalTopic(), event.getOriginalMessage());
+            } else {
+                // Log for manual intervention
+                log.error("Message failed after 3 retries: {}", event);
+            }
+        } catch (Exception e) {
+            log.error("Error processing dead letter: {}", e.getMessage(), e);
+        }
+    }
+}
+```
+
+## Event Sourcing Implementation
+
+### Event Store
+
+```java
+@Entity
+@Table(name = "event_store")
+public class EventStore {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(name = "aggregate_id")
+    private String aggregateId;
+    
+    @Column(name = "event_type")
+    private String eventType;
+    
+    @Column(name = "event_data", columnDefinition = "TEXT")
+    private String eventData;
+    
+    @Column(name = "version")
+    private Long version;
+    
+    @Column(name = "timestamp")
+    private Instant timestamp;
+    
+    // Constructors, getters, setters
+}
+
+@Repository
+public interface EventStoreRepository extends JpaRepository<EventStore, Long> {
+    
+    List<EventStore> findByAggregateIdOrderByVersion(String aggregateId);
+    
+    @Query("SELECT MAX(e.version) FROM EventStore e WHERE e.aggregateId = :aggregateId")
+    Optional<Long> findMaxVersionByAggregateId(@Param("aggregateId") String aggregateId);
+}
+```
+
+### Event Sourcing Service
+
+```java
+@Service
+public class EventSourcingService {
+    
+    private final EventStoreRepository eventStoreRepository;
+    private final OddsEventProducer oddsEventProducer;
+    
+    public void saveEvent(String aggregateId, String eventType, Object eventData) {
+        EventStore event = new EventStore();
+        event.setAggregateId(aggregateId);
+        event.setEventType(eventType);
+        event.setEventData(objectMapper.writeValueAsString(eventData));
+        event.setTimestamp(Instant.now());
+        
+        // Get next version
+        Long currentVersion = eventStoreRepository
+            .findMaxVersionByAggregateId(aggregateId)
+            .orElse(0L);
+        event.setVersion(currentVersion + 1);
+        
+        eventStoreRepository.save(event);
+        
+        // Publish to Kafka
+        oddsEventProducer.publishOddsUpdate((OddsEvent) eventData);
+    }
+    
+    public List<EventStore> getEvents(String aggregateId) {
+        return eventStoreRepository.findByAggregateIdOrderByVersion(aggregateId);
+    }
+}
+```
+
+## Monitoring and Observability
+
+### Kafka Metrics
+
+```java
+@Configuration
+public class KafkaMetricsConfig {
+    
+    @Bean
+    public MeterRegistry meterRegistry() {
+        return new SimpleMeterRegistry();
+    }
+    
+    @Bean
+    public KafkaTemplate<String, String> kafkaTemplate(ProducerFactory<String, String> producerFactory) {
+        KafkaTemplate<String, String> template = new KafkaTemplate<>(producerFactory);
+        
+        template.setProducerListener(new ProducerListener<String, String>() {
+            @Override
+            public void onSuccess(ProducerRecord<String, String> record, RecordMetadata metadata) {
+                meterRegistry().counter("kafka.producer.success", 
+                    "topic", record.topic()).increment();
+            }
+            
+            @Override
+            public void onError(ProducerRecord<String, String> record, Exception exception) {
+                meterRegistry().counter("kafka.producer.error", 
+                    "topic", record.topic()).increment();
+            }
+        });
+        
+        return template;
+    }
+}
+```
+
+### Consumer Lag Monitoring
+
+```java
+@Component
+@Slf4j
+public class ConsumerLagMonitor {
+    
+    private final KafkaAdmin kafkaAdmin;
+    private final MeterRegistry meterRegistry;
+    
+    @Scheduled(fixedRate = 30000) // Every 30 seconds
+    public void monitorConsumerLag() {
+        try {
+            Map<String, Object> config = new HashMap<>();
+            config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+            
+            AdminClient adminClient = AdminClient.create(config);
+            
+            // Get consumer group information
+            ListConsumerGroupOffsetsResult offsetsResult = adminClient
+                .listConsumerGroupOffsets("odds-processor");
+            
+            // Calculate lag for each partition
+            // Implementation details...
+            
+        } catch (Exception e) {
+            log.error("Error monitoring consumer lag: {}", e.getMessage(), e);
+        }
+    }
+}
+```
+
+## Performance Optimization
+
+### Producer Configuration
+
+```java
+@Configuration
+public class KafkaProducerConfig {
+    
+    @Bean
+    public ProducerFactory<String, String> producerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.ACKS_CONFIG, "all");
+        config.put(ProducerConfig.RETRIES_CONFIG, 3);
+        config.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
+        config.put(ProducerConfig.LINGER_MS_CONFIG, 1);
+        config.put(ProducerConfig.BUFFER_MEMORY_CONFIG, 33554432);
+        
+        return new DefaultKafkaProducerFactory<>(config);
+    }
+}
+```
+
+### Consumer Configuration
+
+```java
+@Configuration
+public class KafkaConsumerConfig {
+    
+    @Bean
+    public ConsumerFactory<String, String> consumerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        config.put(ConsumerConfig.GROUP_ID_CONFIG, "odds-processor");
+        config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
+        config.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, 500);
+        
+        return new DefaultKafkaConsumerFactory<>(config);
+    }
+    
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, String> factory = 
+            new ConcurrentKafkaListenerContainerFactory<>();
+        factory.setConsumerFactory(consumerFactory());
+        factory.setConcurrency(3);
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL);
+        return factory;
+    }
+}
+```
+
+## Best Practices
+
+1. **Design for Idempotency**: Ensure consumers can handle duplicate messages
+2. **Implement Dead Letter Queues**: Handle failed messages gracefully
+3. **Monitor Consumer Lag**: Track processing delays
+4. **Use Schema Registry**: Ensure message format consistency
+5. **Implement Circuit Breakers**: Handle downstream service failures
+6. **Test with Chaos Engineering**: Verify system resilience
+
+## Next Steps
+
+1. Set up a local Kafka cluster using Docker
+2. Implement a simple producer-consumer application
+3. Add event sourcing to your domain models
+4. Implement dead letter queue handling
+5. Add monitoring and alerting
+6. Scale your cluster for production workloads
+
+Remember: Event-driven architecture adds complexity, so ensure the benefits of loose coupling and scalability outweigh the operational overhead for your use case.
+
+---
